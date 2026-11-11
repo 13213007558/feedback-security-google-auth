@@ -1159,6 +1159,26 @@ Token broker ::
     access_token = downscoped_credentials.token
     expiry = downscoped_credentials.expiry
 
+The credential access boundary is snapshotted when the downscoped
+credentials are created. Mutating the ``CredentialAccessBoundary`` (or any of
+its nested rules, permission lists or conditions) afterwards does not change
+the scope of the existing credentials, including the scope sent to STS on the
+next token refresh; the credentials always use the rules that were confirmed
+at construction time. Credentials derived with
+``with_quota_project`` use the same snapshot. To apply a different set of
+permissions, build a new boundary and explicitly construct new downscoped
+credentials::
+
+    # Build the new boundary and create a new credential. Do not mutate the
+    # boundary of an existing credential in place.
+    new_rule = downscoped.AccessBoundaryRule(
+        available_resource=other_resource,
+        available_permissions=other_permissions)
+    new_boundary = downscoped.CredentialAccessBoundary(rules=[new_rule])
+    new_downscoped_credentials = downscoped.Credentials(
+        source_credentials=source_credentials,
+        credential_access_boundary=new_boundary)
+
 
 For example, a token broker can be set up on a server in a private network.
 Various workloads (token consumers) in the same network will send authenticated

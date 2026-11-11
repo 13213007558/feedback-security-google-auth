@@ -45,9 +45,16 @@ access Google Cloud Storage resources with restricted access.
 Note: Only Cloud Storage supports Credential Access Boundaries. Other Google
 Cloud services do not support this feature.
 
+Note: The downscoped :class:`Credentials` take a deep copy (snapshot) of the
+credential access boundary at construction time. Later changes to the boundary,
+its rules, permissions or conditions do not affect an existing credential, even
+when its token is refreshed. Create a new credential to apply a different set of
+rules.
+
 .. _Downscoping with Credential Access Boundaries: https://cloud.google.com/iam/docs/downscoping-short-lived-credentials
 """
 
+import copy
 import datetime
 
 from google.auth import _helpers
@@ -434,6 +441,15 @@ class Credentials(credentials.CredentialsWithQuotaProject):
     pass the downscoped short-lived access tokens to a token consumer via some
     secure authenticated channel for limited access to Google Cloud Storage
     resources.
+
+    The credential access boundary is snapshotted (deep copied) when the
+    credentials are created. Subsequent mutations of the boundary passed to the
+    constructor, including its nested rules, available permissions and
+    availability conditions, never affect these credentials or the options sent to
+    STS during a refresh. Copies created by :meth:`with_quota_project` share the
+    same snapshot. To use a different set of permissions, explicitly construct a
+    new ``Credentials`` instance with a new credential access boundary instead of
+    mutating the existing one.
     """
 
     def __init__(
@@ -458,7 +474,13 @@ class Credentials(credentials.CredentialsWithQuotaProject):
                 The Credential Access Boundary which contains a list of access boundary
                 rules. Each rule contains information on the resource that the rule applies to,
                 the upper bound of the permissions that are available on that resource and an
-                optional condition to further restrict permissions.
+                optional condition to further restrict permissions. A deep copy of the
+                boundary is taken when the credentials are created, so the credential always
+                uses the rules, permissions and conditions that were in effect at construction
+                time. Mutating the boundary (or any of its nested rules or conditions) after
+                the credentials have been created does not change the scope of these
+                credentials, including on subsequent token refreshes. To change the scope,
+                construct a new set of downscoped credentials with a new boundary.
             quota_project_id (Optional[str]): The optional quota project ID.
             universe_domain (Optional[str]): The universe domain value, default is googleapis.com
         Raises:
@@ -470,12 +492,34 @@ class Credentials(credentials.CredentialsWithQuotaProject):
 
         super(Credentials, self).__init__()
         self._source_credentials = source_credentials
-        self._credential_access_boundary = credential_access_boundary
+        # Take an immutable snapshot of the credential access boundary. The
+        # boundary, its rules, permission lists and conditions are mutable
+        # objects; holding a reference would let later mutations silently change
+        # the permissions requested on the next token refresh. A deep copy
+        # guarantees the credential is always scoped to the boundary confirmed
+        # at construction time.
+        self._credential_access_boundary = copy.deepcopy(credential_access_boundary)
         self._quota_project_id = quota_project_id
         self._universe_domain = universe_domain or credentials.DEFAULT_UNIVERSE_DOMAIN
         self._sts_client = sts.Client(
             _STS_TOKEN_URL_PATTERN.format(self.universe_domain)
         )
+
+    @property
+    def credential_access_boundary(self):
+        """Returns the snapshot of the credential access boundary in effect for
+        these credentials.
+
+        The returned boundary is the deep copy captured when the credentials were
+        created. It is independent of the boundary passed to the constructor, so
+        inspecting it always reflects the rules, permissions and conditions that
+        will be sent to STS on every refresh.
+
+        Returns:
+            google.auth.downscoped.CredentialAccessBoundary: The snapshot of the
+                credential access boundary used by these credentials.
+        """
+        return self._credential_access_boundary
 
     @_helpers.copy_docstring(credentials.Credentials)
     def refresh(self, request):
@@ -505,6 +549,8 @@ class Credentials(credentials.CredentialsWithQuotaProject):
 
     @_helpers.copy_docstring(credentials.CredentialsWithQuotaProject)
     def with_quota_project(self, quota_project_id):
+        # Reuse the captured boundary snapshot so the copy is scoped to the same
+        # rules that were confirmed when the original credentials were created.
         return self.__class__(
             self._source_credentials,
             self._credential_access_boundary,

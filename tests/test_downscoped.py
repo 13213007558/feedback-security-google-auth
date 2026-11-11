@@ -79,6 +79,28 @@ CREDENTIAL_ACCESS_BOUNDARY_JSON = {
         ]
     }
 }
+# A boundary reflecting mutations applied to the original input after the
+# downscoped credentials have been created. The credentials must never send these
+# rules because they were not part of the boundary confirmed at construction time.
+MUTATED_CREDENTIAL_ACCESS_BOUNDARY_JSON = {
+    "accessBoundary": {
+        "accessBoundaryRules": [
+            {
+                "availablePermissions": OTHER_AVAILABLE_PERMISSIONS,
+                "availableResource": OTHER_AVAILABLE_RESOURCE,
+                "availabilityCondition": {
+                    "expression": OTHER_EXPRESSION,
+                    "title": OTHER_TITLE,
+                    "description": OTHER_DESCRIPTION,
+                },
+            },
+            {
+                "availablePermissions": AVAILABLE_PERMISSIONS,
+                "availableResource": AVAILABLE_RESOURCE,
+            },
+        ]
+    }
+}
 
 
 class SourceCredentials(credentials.Credentials):
@@ -791,3 +813,203 @@ class TestCredentials(object):
         assert headers == {
             "authorization": "Bearer {}".format(SUCCESS_RESPONSE["access_token"])
         }
+
+    @staticmethod
+    def get_sts_options(request):
+        """Extracts the JSON-decoded `options` field sent to STS in the most
+        recent token exchange request."""
+        body_tuples = urllib.parse.parse_qsl(request.call_args[1]["body"])
+        body = {
+            key.decode("utf-8"): value.decode("utf-8") for key, value in body_tuples
+        }
+        return json.loads(urllib.parse.unquote(body["options"]))
+
+    @staticmethod
+    def make_boundary():
+        availability_condition = make_availability_condition(
+            EXPRESSION, TITLE, DESCRIPTION
+        )
+        access_boundary_rule = make_access_boundary_rule(
+            AVAILABLE_RESOURCE, AVAILABLE_PERMISSIONS, availability_condition
+        )
+        return make_credential_access_boundary([access_boundary_rule])
+
+    def test_constructor_snapshots_boundary(self):
+        boundary = self.make_boundary()
+        scoped_credentials = downscoped.Credentials(SourceCredentials(), boundary)
+
+        # The credential keeps an independent deep copy rather than the original.
+        assert scoped_credentials.credential_access_boundary is not boundary
+        assert (
+            scoped_credentials.credential_access_boundary.to_json()
+            == boundary.to_json()
+        )
+        assert (
+            scoped_credentials.credential_access_boundary.rules[0]
+            is not boundary.rules[0]
+        )
+        assert (
+            scoped_credentials.credential_access_boundary.rules[0]
+            .availability_condition
+            is not boundary.rules[0].availability_condition
+        )
+
+    def test_refresh_ignores_mutations_to_original_boundary(self):
+        boundary = self.make_boundary()
+        source_credentials = SourceCredentials()
+        scoped_credentials = downscoped.Credentials(source_credentials, boundary)
+        quota_credentials = scoped_credentials.with_quota_project(QUOTA_PROJECT_ID)
+        request = self.make_mock_request(status=http_client.OK, data=SUCCESS_RESPONSE)
+
+        # First refresh on both copies sends the boundary confirmed at creation.
+        scoped_credentials.refresh(request)
+        assert self.get_sts_options(request) == CREDENTIAL_ACCESS_BOUNDARY_JSON
+        quota_credentials.refresh(request)
+        assert self.get_sts_options(request) == CREDENTIAL_ACCESS_BOUNDARY_JSON
+
+        # Mutate every level of the original input: the boundary rule list, a
+        # nested rule, the permission list and the availability condition.
+        other_condition = make_availability_condition(
+            OTHER_EXPRESSION, OTHER_TITLE, OTHER_DESCRIPTION
+        )
+        boundary.rules[0].available_resource = OTHER_AVAILABLE_RESOURCE
+        boundary.rules[0].available_permissions = OTHER_AVAILABLE_PERMISSIONS
+        boundary.rules[0].availability_condition = other_condition
+        boundary.add_rule(
+            make_access_boundary_rule(AVAILABLE_RESOURCE, AVAILABLE_PERMISSIONS)
+        )
+        assert boundary.to_json() == MUTATED_CREDENTIAL_ACCESS_BOUNDARY_JSON
+
+        # Refreshing both copies again must still send the original snapshot; the
+        # new rules must never appear in the STS options.
+        scoped_credentials.refresh(request)
+        assert self.get_sts_options(request) == CREDENTIAL_ACCESS_BOUNDARY_JSON
+        quota_credentials.refresh(request)
+        assert self.get_sts_options(request) == CREDENTIAL_ACCESS_BOUNDARY_JSON
+        assert (
+            scoped_credentials.credential_access_boundary.to_json()
+            == CREDENTIAL_ACCESS_BOUNDARY_JSON
+        )
+
+    def test_refresh_ignores_mutations_to_original_input_lists(self):
+        permissions = list(AVAILABLE_PERMISSIONS)
+        rule = make_access_boundary_rule(AVAILABLE_RESOURCE, permissions)
+        rules = [rule]
+        boundary = make_credential_access_boundary(rules)
+        scoped_credentials = downscoped.Credentials(SourceCredentials(), boundary)
+        request = self.make_mock_request(status=http_client.OK, data=SUCCESS_RESPONSE)
+
+        scoped_credentials.refresh(request)
+        assert self.get_sts_options(request) == {
+            "accessBoundary": {
+                "accessBoundaryRules": [
+                    {
+                        "availablePermissions": AVAILABLE_PERMISSIONS,
+                        "availableResource": AVAILABLE_RESOURCE,
+                    }
+                ]
+            }
+        }
+
+        # Mutate the caller-owned input lists in place after credential creation.
+        permissions.append("inRole:roles/storage.objectAdmin")
+        rules.append(
+            make_access_boundary_rule(
+                OTHER_AVAILABLE_RESOURCE, OTHER_AVAILABLE_PERMISSIONS
+            )
+        )
+
+        scoped_credentials.refresh(request)
+        assert self.get_sts_options(request) == {
+            "accessBoundary": {
+                "accessBoundaryRules": [
+                    {
+                        "availablePermissions": AVAILABLE_PERMISSIONS,
+                        "availableResource": AVAILABLE_RESOURCE,
+                    }
+                ]
+            }
+        }
+
+    def test_with_quota_project_shares_boundary_snapshot(self):
+        boundary = self.make_boundary()
+        scoped_credentials = downscoped.Credentials(SourceCredentials(), boundary)
+        quota_credentials = scoped_credentials.with_quota_project(QUOTA_PROJECT_ID)
+
+        # Both credentials are scoped to the same snapshot contents, not to the
+        # caller's mutable boundary.
+        assert (
+            quota_credentials.credential_access_boundary.to_json()
+            == scoped_credentials.credential_access_boundary.to_json()
+        )
+        assert quota_credentials.credential_access_boundary is not boundary
+        assert quota_credentials.quota_project_id == QUOTA_PROJECT_ID
+        # The source credential remains shared and fully capable of refreshing.
+        assert (
+            quota_credentials._source_credentials
+            is scoped_credentials._source_credentials
+        )
+
+    def test_new_credentials_required_to_change_boundary(self):
+        boundary = self.make_boundary()
+        scoped_credentials = downscoped.Credentials(SourceCredentials(), boundary)
+        request = self.make_mock_request(status=http_client.OK, data=SUCCESS_RESPONSE)
+
+        scoped_credentials.refresh(request)
+        assert self.get_sts_options(request) == CREDENTIAL_ACCESS_BOUNDARY_JSON
+
+        # A different scope requires explicitly constructing new credentials.
+        new_boundary = make_credential_access_boundary(
+            [
+                make_access_boundary_rule(
+                    OTHER_AVAILABLE_RESOURCE,
+                    OTHER_AVAILABLE_PERMISSIONS,
+                    make_availability_condition(
+                        OTHER_EXPRESSION, OTHER_TITLE, OTHER_DESCRIPTION
+                    ),
+                )
+            ]
+        )
+        new_credentials = downscoped.Credentials(
+            scoped_credentials._source_credentials, new_boundary
+        )
+        new_credentials.refresh(request)
+        assert self.get_sts_options(request) == {
+            "accessBoundary": {
+                "accessBoundaryRules": [
+                    {
+                        "availablePermissions": OTHER_AVAILABLE_PERMISSIONS,
+                        "availableResource": OTHER_AVAILABLE_RESOURCE,
+                        "availabilityCondition": {
+                            "expression": OTHER_EXPRESSION,
+                            "title": OTHER_TITLE,
+                            "description": OTHER_DESCRIPTION,
+                        },
+                    }
+                ]
+            }
+        }
+        # The original credential is still scoped to its own snapshot.
+        assert (
+            scoped_credentials.credential_access_boundary.to_json()
+            == CREDENTIAL_ACCESS_BOUNDARY_JSON
+        )
+
+    def test_refresh_still_refreshes_source_credentials(self):
+        source_credentials = SourceCredentials()
+        scoped_credentials = downscoped.Credentials(
+            source_credentials, self.make_boundary()
+        )
+        request = self.make_mock_request(status=http_client.OK, data=SUCCESS_RESPONSE)
+
+        with mock.patch.object(
+            source_credentials, "refresh", wraps=source_credentials.refresh
+        ) as wrapped_source_refresh:
+            scoped_credentials.refresh(request)
+            scoped_credentials.refresh(request)
+
+        # Snapshotting the boundary must not interfere with source refresh: a
+        # fresh source token is obtained for every downscoped token exchange.
+        assert wrapped_source_refresh.call_count == 2
+        wrapped_source_refresh.assert_called_with(request)
+        assert source_credentials.token == "ACCESS_TOKEN_2"
