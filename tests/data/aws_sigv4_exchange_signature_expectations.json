@@ -1,0 +1,132 @@
+[
+  {
+    "intent_alignment": {
+      "audience_equals_signed_target": true
+    },
+    "label": "default_supplier_temporary_credentials",
+    "signed_get_caller_identity": {
+      "amz_date": "20200811T065522Z",
+      "credential": "AKIAIOSFODNN7EXAMPLE/20200811/us-east-2/sts/aws4_request",
+      "embedded_signature": "460b491cd92b746345219747e679bf55541e3f8bb18eb11516305dbecded91b8",
+      "method": "POST",
+      "recomputed_signature": "460b491cd92b746345219747e679bf55541e3f8bb18eb11516305dbecded91b8",
+      "session_token_header": "AQoEXAMPLEH4aoAH0gNCAPyJxz4BlCFFxWNE1OPTgk5TthT+FvwqnKwRcOIfrRh3c/LTo6UDdyJwOOvEVPvLXCrrrUtdnniCEXAMPLE/IvU1dYUg2RVAJBanLiHb4IgRmpRV3zrkuWJOgQs8IZZaIv2BXIa2R4OlgkBN9bkUDNCJiBeb/AXlzBBko7b15fjrBs2+cTQtpZ3CYWFXG8C5zqx37wnOE49mRl/+OtkIKGO7fAE",
+      "signatures_match": true,
+      "signed_headers": "host;x-amz-date;x-amz-security-token;x-goog-cloud-target-resource",
+      "signed_headers_match": true,
+      "target_resource_header": "//iam.googleapis.com/projects/123456/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID",
+      "url": "https://sts.us-east-2.amazonaws.com?Action=GetCallerIdentity&Version=2011-06-15"
+    },
+    "sts": {
+      "audience": "//iam.googleapis.com/projects/123456/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID",
+      "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+      "method": "POST",
+      "subject_token_type": "urn:ietf:params:aws:token-type:aws4_request",
+      "url": "https://sts.googleapis.com/v1/token"
+    }
+  },
+  {
+    "intent_alignment": {
+      "audience_equals_signed_target": true
+    },
+    "label": "custom_supplier_temporary_credentials",
+    "signed_get_caller_identity": {
+      "amz_date": "20200811T065522Z",
+      "credential": "AKIAIOSFODNN7EXAMPLE/20200811/us-east-2/sts/aws4_request",
+      "embedded_signature": "460b491cd92b746345219747e679bf55541e3f8bb18eb11516305dbecded91b8",
+      "method": "POST",
+      "recomputed_signature": "460b491cd92b746345219747e679bf55541e3f8bb18eb11516305dbecded91b8",
+      "session_token_header": "AQoEXAMPLEH4aoAH0gNCAPyJxz4BlCFFxWNE1OPTgk5TthT+FvwqnKwRcOIfrRh3c/LTo6UDdyJwOOvEVPvLXCrrrUtdnniCEXAMPLE/IvU1dYUg2RVAJBanLiHb4IgRmpRV3zrkuWJOgQs8IZZaIv2BXIa2R4OlgkBN9bkUDNCJiBeb/AXlzBBko7b15fjrBs2+cTQtpZ3CYWFXG8C5zqx37wnOE49mRl/+OtkIKGO7fAE",
+      "signatures_match": true,
+      "signed_headers": "host;x-amz-date;x-amz-security-token;x-goog-cloud-target-resource",
+      "signed_headers_match": true,
+      "target_resource_header": "//iam.googleapis.com/projects/123456/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID",
+      "url": "https://sts.us-east-2.amazonaws.com?Action=GetCallerIdentity&Version=2011-06-15"
+    },
+    "sts": {
+      "audience": "//iam.googleapis.com/projects/123456/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID",
+      "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+      "method": "POST",
+      "subject_token_type": "urn:ietf:params:aws:token-type:aws4_request",
+      "url": "https://sts.googleapis.com/v1/token"
+    }
+  },
+  {
+    "intent_alignment": {
+      "audience_equals_signed_target": true
+    },
+    "label": "custom_supplier_permanent_credentials",
+    "signed_get_caller_identity": {
+      "amz_date": "20200811T065522Z",
+      "credential": "AKIAIOSFODNN7EXAMPLE/20200811/us-east-2/sts/aws4_request",
+      "embedded_signature": "fae09118e41357ad87677b120e1977871dadb5d8b4110e6d46fb50c8f7a4ff7f",
+      "method": "POST",
+      "recomputed_signature": "fae09118e41357ad87677b120e1977871dadb5d8b4110e6d46fb50c8f7a4ff7f",
+      "session_token_header": null,
+      "signatures_match": true,
+      "signed_headers": "host;x-amz-date;x-goog-cloud-target-resource",
+      "signed_headers_match": true,
+      "target_resource_header": "//iam.googleapis.com/projects/123456/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID",
+      "url": "https://sts.us-east-2.amazonaws.com?Action=GetCallerIdentity&Version=2011-06-15"
+    },
+    "sts": {
+      "audience": "//iam.googleapis.com/projects/123456/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID",
+      "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+      "method": "POST",
+      "subject_token_type": "urn:ietf:params:aws:token-type:aws4_request",
+      "url": "https://sts.googleapis.com/v1/token"
+    }
+  },
+  {
+    "intent_alignment": {
+      "audience_equals_signed_target": true
+    },
+    "label": "custom_supplier_alternate_target",
+    "signed_get_caller_identity": {
+      "amz_date": "20200811T065522Z",
+      "credential": "AKIAIOSFODNN7EXAMPLE/20200811/us-east-2/sts/aws4_request",
+      "embedded_signature": "af6bc19707390fb820554d4da18627dc792ff054bf76edcb747496e6b0bfecc2",
+      "method": "POST",
+      "recomputed_signature": "af6bc19707390fb820554d4da18627dc792ff054bf76edcb747496e6b0bfecc2",
+      "session_token_header": "AQoEXAMPLEH4aoAH0gNCAPyJxz4BlCFFxWNE1OPTgk5TthT+FvwqnKwRcOIfrRh3c/LTo6UDdyJwOOvEVPvLXCrrrUtdnniCEXAMPLE/IvU1dYUg2RVAJBanLiHb4IgRmpRV3zrkuWJOgQs8IZZaIv2BXIa2R4OlgkBN9bkUDNCJiBeb/AXlzBBko7b15fjrBs2+cTQtpZ3CYWFXG8C5zqx37wnOE49mRl/+OtkIKGO7fAE",
+      "signatures_match": true,
+      "signed_headers": "host;x-amz-date;x-amz-security-token;x-goog-cloud-target-resource",
+      "signed_headers_match": true,
+      "target_resource_header": "//iam.googleapis.com/projects/123456/locations/global/workloadIdentityPools/OTHER_POOL/providers/OTHER_PROVIDER",
+      "url": "https://sts.us-east-2.amazonaws.com?Action=GetCallerIdentity&Version=2011-06-15"
+    },
+    "sts": {
+      "audience": "//iam.googleapis.com/projects/123456/locations/global/workloadIdentityPools/OTHER_POOL/providers/OTHER_PROVIDER",
+      "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+      "method": "POST",
+      "subject_token_type": "urn:ietf:params:aws:token-type:aws4_request",
+      "url": "https://sts.googleapis.com/v1/token"
+    }
+  },
+  {
+    "intent_alignment": {
+      "audience_equals_signed_target": true
+    },
+    "label": "custom_supplier_swapped_credentials",
+    "signed_get_caller_identity": {
+      "amz_date": "20200811T065522Z",
+      "credential": "AKIAIOSFODNN7OTHER00/20200811/us-east-2/sts/aws4_request",
+      "embedded_signature": "834b2526068899a3f70612d0de7e36e4e056614c774ce2243ec0c99b7e80ae15",
+      "method": "POST",
+      "recomputed_signature": "834b2526068899a3f70612d0de7e36e4e056614c774ce2243ec0c99b7e80ae15",
+      "session_token_header": "AQoEXAMPLEOTHERSESSIONTOKEN000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "signatures_match": true,
+      "signed_headers": "host;x-amz-date;x-amz-security-token;x-goog-cloud-target-resource",
+      "signed_headers_match": true,
+      "target_resource_header": "//iam.googleapis.com/projects/123456/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID",
+      "url": "https://sts.us-east-2.amazonaws.com?Action=GetCallerIdentity&Version=2011-06-15"
+    },
+    "sts": {
+      "audience": "//iam.googleapis.com/projects/123456/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID",
+      "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+      "method": "POST",
+      "subject_token_type": "urn:ietf:params:aws:token-type:aws4_request",
+      "url": "https://sts.googleapis.com/v1/token"
+    }
+  }
+]

@@ -65,6 +65,10 @@ _AWS_REQUEST_TYPE = "aws4_request"
 _AWS_SECURITY_TOKEN_HEADER = "x-amz-security-token"
 # The AWS authorization header name for the auto-generated date.
 _AWS_DATE_HEADER = "x-amz-date"
+# The GCP STS header name for the target workload identity pool provider
+# resource. This header is included in the AWS Signature Version 4 signing
+# process to bind the signed GetCallerIdentity request to the target resource.
+_GOOG_CLOUD_TARGET_RESOURCE_HEADER = "x-goog-cloud-target-resource"
 # The default AWS regional credential verification URL.
 _DEFAULT_AWS_REGIONAL_CREDENTIAL_VERIFICATION_URL = (
     "https://sts.{region}.amazonaws.com?Action=GetCallerIdentity&Version=2011-06-15"
@@ -736,8 +740,9 @@ class Credentials(external_account.Credentials):
 
         Generate the signed request to AWS STS GetCallerIdentity action.
 
-        Inject x-goog-cloud-target-resource into header and serialize the
-        signed request. This will be the subject-token to pass to GCP STS.
+        Sign the x-goog-cloud-target-resource header together with the
+        GetCallerIdentity request and serialize the signed request. This will
+        be the subject-token to pass to GCP STS.
 
         .. _AWS GetCallerIdentity signed request:
             https://cloud.google.com/iam/docs/access-resources-aws#exchange-token
@@ -766,11 +771,21 @@ class Credentials(external_account.Credentials):
         )
         # Generate the signed request to AWS STS GetCallerIdentity API.
         # Use the required regional endpoint. Otherwise, the request will fail.
+        # The x-goog-cloud-target-resource header must be included as part of
+        # the Signature Version 4 signing process so that the signature covers
+        # the target workload identity pool provider. This binds the signed
+        # GetCallerIdentity authorization to the intended GCP resource and
+        # prevents tampering with the target resource after signing.
         request_options = self._request_signer.get_request_options(
             aws_security_credentials,
             self._cred_verification_url.replace("{region}", self._region),
             "POST",
+            additional_headers={
+                _GOOG_CLOUD_TARGET_RESOURCE_HEADER: self._target_resource
+            },
         )
+        request_headers = request_options.get("headers")
+
         # The GCP STS endpoint expects the headers to be formatted as:
         # [
         #   {key: 'x-amz-date', value: '...'},
@@ -783,13 +798,6 @@ class Credentials(external_account.Credentials):
         #   method: 'POST',
         #   headers: [{key: 'x-amz-date', value: '...'}, ...]
         # }))
-        request_headers = request_options.get("headers")
-        # The full, canonical resource name of the workload identity pool
-        # provider, with or without the HTTPS prefix.
-        # Including this header as part of the signature is recommended to
-        # ensure data integrity.
-        request_headers["x-goog-cloud-target-resource"] = self._target_resource
-
         # Serialize AWS signed request.
         aws_signed_req = {}
         aws_signed_req["url"] = request_options.get("url")

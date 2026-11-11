@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import datetime
+import hashlib
+import hmac
 import http.client as http_client
 import json
 import os
@@ -20,6 +22,11 @@ from unittest import mock
 import urllib.parse
 
 import pytest  # type: ignore
+
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+AWS_SIGNATURE_EXPECTATIONS_PATH = os.path.join(
+    DATA_DIR, "aws_sigv4_exchange_signature_expectations.json"
+)
 
 from google.auth import _helpers, external_account
 from google.auth import aws
@@ -56,6 +63,14 @@ TOKEN_URL = "https://sts.googleapis.com/v1/token"
 TOKEN_INFO_URL = "https://sts.googleapis.com/v1/introspect"
 SUBJECT_TOKEN_TYPE = "urn:ietf:params:aws:token-type:aws4_request"
 AUDIENCE = "//iam.googleapis.com/projects/123456/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID"
+# A distinct target resource used to verify that changing the target
+# configuration changes both the STS audience and the signed request.
+ALTERNATE_AUDIENCE = "//iam.googleapis.com/projects/123456/locations/global/workloadIdentityPools/OTHER_POOL/providers/OTHER_PROVIDER"
+# A second set of fake AWS credentials used to verify that swapping the
+# credential source changes the SigV4 signature independently of the target.
+ALTERNATE_ACCESS_KEY_ID = "AKIAIOSFODNN7OTHER00"
+ALTERNATE_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYOTHERKEY00000"
+ALTERNATE_TOKEN = "AQoEXAMPLEOTHERSESSIONTOKEN000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
 REGION_URL = "http://169.254.169.254/latest/meta-data/placement/availability-zone"
 IMDSV2_SESSION_TOKEN_URL = "http://169.254.169.254/latest/api/token"
 SECURITY_CREDS_URL = "http://169.254.169.254/latest/meta-data/iam/security-credentials"
@@ -737,42 +752,31 @@ class TestCredentials(object):
         aws_security_credentials,
         region_name="us-east-2",
         url="https://sts.us-east-2.amazonaws.com?Action=GetCallerIdentity&Version=2011-06-15",
+        target_resource=AUDIENCE,
     ):
         """Utility to generate serialize AWS signed requests.
         This makes it easy to assert generated subject tokens based on the
-        provided AWS security credentials, regions and AWS STS endpoint.
+        provided AWS security credentials, regions and AWS STS endpoint. The
+        x-goog-cloud-target-resource header is signed as part of the AWS
+        Signature Version 4 process, mirroring the production construction.
         """
         request_signer = aws.RequestSigner(region_name)
         signed_request = request_signer.get_request_options(
-            aws_security_credentials, url, "POST"
+            aws_security_credentials,
+            url,
+            "POST",
+            additional_headers={
+                "x-goog-cloud-target-resource": target_resource
+            },
         )
         reformatted_signed_request = {
             "url": signed_request.get("url"),
             "method": signed_request.get("method"),
             "headers": [
-                {
-                    "key": "Authorization",
-                    "value": signed_request.get("headers").get("Authorization"),
-                },
-                {"key": "host", "value": signed_request.get("headers").get("host")},
-                {
-                    "key": "x-amz-date",
-                    "value": signed_request.get("headers").get("x-amz-date"),
-                },
+                {"key": key, "value": value}
+                for key, value in signed_request.get("headers").items()
             ],
         }
-        # Include security token if available.
-        if aws_security_credentials.session_token is not None:
-            reformatted_signed_request.get("headers").append(
-                {
-                    "key": "x-amz-security-token",
-                    "value": signed_request.get("headers").get("x-amz-security-token"),
-                }
-            )
-        # Append x-goog-cloud-target-resource header.
-        reformatted_signed_request.get("headers").append(
-            {"key": "x-goog-cloud-target-resource", "value": AUDIENCE}
-        ),
         return urllib.parse.quote(
             json.dumps(
                 reformatted_signed_request, separators=(",", ":"), sort_keys=True
@@ -882,9 +886,10 @@ class TestCredentials(object):
         scopes=None,
         default_scopes=None,
         service_account_impersonation_url=None,
+        audience_override=AUDIENCE,
     ):
         return aws.Credentials(
-            audience=AUDIENCE,
+            audience=audience_override,
             subject_token_type=SUBJECT_TOKEN_TYPE,
             token_url=token_url,
             token_info_url=token_info_url,
@@ -2456,3 +2461,765 @@ class TestCredentials(object):
         assert credentials.quota_project_id == QUOTA_PROJECT_ID
         assert credentials.scopes == SCOPES
         assert credentials.default_scopes == ["ignored"]
+
+
+def _hmac_sha256(key, message):
+    return hmac.new(key, message.encode("utf-8"), hashlib.sha256).digest()
+
+
+def _derive_sigv4_signing_key(secret_access_key, date_stamp, region, service):
+    """Independently derives the AWS SigV4 signing key.
+
+    This mirrors the public AWS Signature Version 4 derivation steps without
+    reusing any google.auth.aws signing helper.
+    """
+    k_date = _hmac_sha256(("AWS4" + secret_access_key).encode("utf-8"), date_stamp)
+    k_region = _hmac_sha256(k_date, region)
+    k_service = _hmac_sha256(k_region, service)
+    return _hmac_sha256(k_service, "aws4_request")
+
+
+def _canonical_query_string(raw_query):
+    parsed = urllib.parse.parse_qs(raw_query)
+    pairs = []
+    for key in sorted(parsed):
+        encoded_key = urllib.parse.quote(key, safe="-_.~")
+        for value in sorted(parsed[key]):
+            pairs.append(
+                "{}={}".format(
+                    encoded_key, urllib.parse.quote(value, safe="-_.~")
+                )
+            )
+    return "&".join(pairs)
+
+
+def _recompute_sigv4_signature(
+    headers,
+    url,
+    method,
+    aws_security_credentials,
+    region,
+    amz_date,
+    request_payload="",
+):
+    """Recomputes the SigV4 signature for a GetCallerIdentity request.
+
+    All inputs are taken from the serialized subject token (or a tampered
+    variant of it) so the check is fully independent of the production signer.
+    Returns the recomputed hex signature and the expected signed headers.
+    """
+    parsed_url = urllib.parse.urlparse(url)
+    host = parsed_url.hostname
+    service_name = host.split(".")[0]
+    date_stamp = amz_date[:8]
+
+    full_headers = {key.lower(): value for key, value in headers.items()}
+    full_headers.setdefault("host", host)
+    signed_header_keys = sorted(full_headers.keys())
+    canonical_headers = "".join(
+        "{}:{}\n".format(key, full_headers[key]) for key in signed_header_keys
+    )
+    signed_headers = ";".join(signed_header_keys)
+    payload_hash = hashlib.sha256(
+        (request_payload or "").encode("utf-8")
+    ).hexdigest()
+
+    canonical_request = "\n".join(
+        [
+            method,
+            parsed_url.path or "/",
+            _canonical_query_string(parsed_url.query),
+            canonical_headers,
+            signed_headers,
+            payload_hash,
+        ]
+    )
+    credential_scope = "{}/{}/{}/aws4_request".format(
+        date_stamp, region, service_name
+    )
+    string_to_sign = "\n".join(
+        [
+            "AWS4-HMAC-SHA256",
+            amz_date,
+            credential_scope,
+            hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+        ]
+    )
+    signing_key = _derive_sigv4_signing_key(
+        aws_security_credentials.secret_access_key,
+        date_stamp,
+        region,
+        service_name,
+    )
+    signature = hmac.new(
+        signing_key, string_to_sign.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return signature, signed_headers
+
+
+def _parse_subject_token(subject_token):
+    """Decodes a serialized AWS signed request subject token."""
+    return json.loads(urllib.parse.unquote(subject_token))
+
+
+def _subject_token_header_map(subject_token):
+    signed_request = _parse_subject_token(subject_token)
+    return {
+        header["key"]: header["value"]
+        for header in signed_request["headers"]
+    }
+
+
+def _extract_authorization_parts(authorization_header):
+    # AWS4-HMAC-SHA256 Credential=<key>/<scope>, SignedHeaders=<...>, Signature=<sig>
+    params = dict(
+        item.split("=", 1)
+        for item in authorization_header.split(" ", 1)[1].split(", ")
+    )
+    return {
+        "algorithm": authorization_header.split(" ", 1)[0],
+        "credential": params["Credential"],
+        "signed_headers": params["SignedHeaders"],
+        "signature": params["Signature"],
+    }
+
+
+class TestAwsExchangeChainSecurity(object):
+    """End-to-end security checks for the AWS -> GCP STS token exchange chain.
+
+    These tests never contact AWS or Google. All timestamps and AWS security
+    credentials are fixed fakes, and every HTTP request is served by mocks.
+    They verify that:
+      * the x-goog-cloud-target-resource header is covered by the SigV4
+        signature (an independently recomputed signature must match);
+      * tampering with only the target resource after signing breaks the
+        signature (the authorization intent cannot be redirected);
+      * the GCP STS exchange request carries an audience matching the signed
+        target resource together with the expected URL, method and temporary
+        AWS session token;
+      * both the default credential source and a custom supplier behave
+        consistently, and swapping credential source vs. target configuration
+        are distinguishable changes.
+    """
+
+    AWS_REGION = "us-east-2"
+    SIGNATURE_TIME = "2020-08-11T06:55:22Z"
+    AMZ_DATE = "20200811T065522Z"
+    DATE_STAMP = "20200811"
+    CREDENTIAL_SOURCE = TestCredentials.CREDENTIAL_SOURCE
+    STS_URL = CRED_VERIFICATION_URL.replace("{region}", AWS_REGION)
+
+    @pytest.fixture(autouse=True)
+    def fixed_time(self):
+        with mock.patch(
+            "google.auth._helpers.utcnow",
+            return_value=datetime.datetime.strptime(
+                self.SIGNATURE_TIME, "%Y-%m-%dT%H:%M:%SZ"
+            ),
+        ):
+            yield
+
+    def _default_credentials(self, audience=AUDIENCE):
+        return TestCredentials.make_credentials(
+            audience_override=audience,
+            credential_source=self.CREDENTIAL_SOURCE,
+        )
+
+    def _supplier_credentials(
+        self, aws_security_credentials, audience=AUDIENCE
+    ):
+        supplier = TestAwsSecurityCredentialsSupplier(
+            security_credentials=aws_security_credentials,
+            region=self.AWS_REGION,
+        )
+        return TestCredentials.make_credentials(
+            audience_override=audience,
+            aws_security_credentials_supplier=supplier,
+        )
+
+    def _default_supplier_request(self):
+        # The default supplier hits IMDS for region, role name and credentials.
+        return TestCredentials.make_mock_request(
+            region_status=http_client.OK,
+            region_name=self.AWS_REGION,
+            role_status=http_client.OK,
+            role_name=TestCredentials.AWS_ROLE,
+            security_credentials_status=http_client.OK,
+            security_credentials_data=TestCredentials.AWS_SECURITY_CREDENTIALS_RESPONSE,
+            token_status=http_client.OK,
+            token_data=TestCredentials.SUCCESS_RESPONSE,
+        )
+
+    def _build_exchange_record(
+        self,
+        label,
+        credentials,
+        aws_security_credentials,
+        request,
+        expected_audience,
+    ):
+        """Runs one exchange and records signature + STS request correspondence."""
+        credentials.refresh(request)
+
+        # The last outbound call is the GCP STS token exchange.
+        sts_call = request.call_args_list[-1][1]
+        sts_body = dict(
+            (key.decode("utf-8"), value.decode("utf-8"))
+            for key, value in urllib.parse.parse_qsl(sts_call["body"])
+        )
+        subject_token = sts_body["subject_token"]
+
+        signed_request = _parse_subject_token(subject_token)
+        header_map = _subject_token_header_map(subject_token)
+        authorization = _extract_authorization_parts(
+            header_map["Authorization"]
+        )
+
+        # Recompute the signature purely from the serialized token contents.
+        recomputed_headers = {
+            key: value
+            for key, value in header_map.items()
+            if key != "Authorization"
+        }
+        recomputed_signature, recomputed_signed_headers = _recompute_sigv4_signature(
+            recomputed_headers,
+            signed_request["url"],
+            signed_request["method"],
+            aws_security_credentials,
+            self.AWS_REGION,
+            header_map["x-amz-date"],
+        )
+
+        return {
+            "label": label,
+            "sts": {
+                "url": sts_call["url"],
+                "method": sts_call["method"],
+                "audience": sts_body["audience"],
+                "subject_token_type": sts_body["subject_token_type"],
+                "grant_type": sts_body["grant_type"],
+            },
+            "signed_get_caller_identity": {
+                "url": signed_request["url"],
+                "method": signed_request["method"],
+                "signed_headers": authorization["signed_headers"],
+                "embedded_signature": authorization["signature"],
+                "recomputed_signature": recomputed_signature,
+                "signatures_match": authorization["signature"]
+                == recomputed_signature,
+                "signed_headers_match": authorization["signed_headers"]
+                == recomputed_signed_headers,
+                "target_resource_header": header_map[
+                    "x-goog-cloud-target-resource"
+                ],
+                "session_token_header": header_map.get("x-amz-security-token"),
+                "amz_date": header_map["x-amz-date"],
+                "credential": authorization["credential"],
+            },
+            "intent_alignment": {
+                "audience_equals_signed_target": sts_body["audience"]
+                == header_map["x-goog-cloud-target-resource"]
+                == expected_audience,
+            },
+        }
+
+    def _all_records(self):
+        temp_creds = aws.AwsSecurityCredentials(
+            ACCESS_KEY_ID, SECRET_ACCESS_KEY, TOKEN
+        )
+        permanent_creds = aws.AwsSecurityCredentials(
+            ACCESS_KEY_ID, SECRET_ACCESS_KEY
+        )
+        alternate_creds = aws.AwsSecurityCredentials(
+            ALTERNATE_ACCESS_KEY_ID,
+            ALTERNATE_SECRET_ACCESS_KEY,
+            ALTERNATE_TOKEN,
+        )
+
+        records = []
+
+        # 1. Default credential source (IMDS) with temporary credentials.
+        records.append(
+            self._build_exchange_record(
+                "default_supplier_temporary_credentials",
+                self._default_credentials(),
+                temp_creds,
+                self._default_supplier_request(),
+                AUDIENCE,
+            )
+        )
+
+        # 2. Custom supplier with temporary credentials.
+        records.append(
+            self._build_exchange_record(
+                "custom_supplier_temporary_credentials",
+                self._supplier_credentials(temp_creds),
+                temp_creds,
+                TestCredentials.make_mock_request(
+                    token_status=http_client.OK,
+                    token_data=TestCredentials.SUCCESS_RESPONSE,
+                ),
+                AUDIENCE,
+            )
+        )
+
+        # 3. Custom supplier with permanent credentials (no session token).
+        records.append(
+            self._build_exchange_record(
+                "custom_supplier_permanent_credentials",
+                self._supplier_credentials(permanent_creds),
+                permanent_creds,
+                TestCredentials.make_mock_request(
+                    token_status=http_client.OK,
+                    token_data=TestCredentials.SUCCESS_RESPONSE,
+                ),
+                AUDIENCE,
+            )
+        )
+
+        # 4. Same credentials, different target configuration.
+        records.append(
+            self._build_exchange_record(
+                "custom_supplier_alternate_target",
+                self._supplier_credentials(temp_creds, ALTERNATE_AUDIENCE),
+                temp_creds,
+                TestCredentials.make_mock_request(
+                    token_status=http_client.OK,
+                    token_data=TestCredentials.SUCCESS_RESPONSE,
+                ),
+                ALTERNATE_AUDIENCE,
+            )
+        )
+
+        # 5. Same target, swapped credential source.
+        records.append(
+            self._build_exchange_record(
+                "custom_supplier_swapped_credentials",
+                self._supplier_credentials(alternate_creds),
+                alternate_creds,
+                TestCredentials.make_mock_request(
+                    token_status=http_client.OK,
+                    token_data=TestCredentials.SUCCESS_RESPONSE,
+                ),
+                AUDIENCE,
+            )
+        )
+
+        return records
+
+    def test_independent_signature_recompute_matches_subject_token(self):
+        temp_creds = aws.AwsSecurityCredentials(
+            ACCESS_KEY_ID, SECRET_ACCESS_KEY, TOKEN
+        )
+        subject_token = self._supplier_credentials(
+            temp_creds
+        ).retrieve_subject_token(TestCredentials.make_mock_request())
+
+        signed_request = _parse_subject_token(subject_token)
+        header_map = _subject_token_header_map(subject_token)
+        authorization = _extract_authorization_parts(
+            header_map["Authorization"]
+        )
+
+        # The target resource must be among the SigV4 signed headers.
+        assert "x-goog-cloud-target-resource" in authorization["signed_headers"]
+        assert (
+            header_map["x-goog-cloud-target-resource"] == AUDIENCE
+        )
+
+        recomputed_signature, recomputed_signed_headers = _recompute_sigv4_signature(
+            {
+                key: value
+                for key, value in header_map.items()
+                if key != "Authorization"
+            },
+            signed_request["url"],
+            signed_request["method"],
+            temp_creds,
+            self.AWS_REGION,
+            header_map["x-amz-date"],
+        )
+
+        assert recomputed_signed_headers == authorization["signed_headers"]
+        assert recomputed_signature == authorization["signature"]
+
+    def test_tampered_target_resource_fails_independent_verification(self):
+        temp_creds = aws.AwsSecurityCredentials(
+            ACCESS_KEY_ID, SECRET_ACCESS_KEY, TOKEN
+        )
+        subject_token = self._supplier_credentials(
+            temp_creds
+        ).retrieve_subject_token(TestCredentials.make_mock_request())
+
+        signed_request = _parse_subject_token(subject_token)
+        header_map = _subject_token_header_map(subject_token)
+        authorization = _extract_authorization_parts(
+            header_map["Authorization"]
+        )
+
+        # Attacker changes only the target resource header after the request
+        # was signed; every other serialized field stays untouched.
+        tampered_headers = {
+            key: value
+            for key, value in header_map.items()
+            if key != "Authorization"
+        }
+        tampered_headers["x-goog-cloud-target-resource"] = ALTERNATE_AUDIENCE
+
+        tampered_signature, _ = _recompute_sigv4_signature(
+            tampered_headers,
+            signed_request["url"],
+            signed_request["method"],
+            temp_creds,
+            self.AWS_REGION,
+            header_map["x-amz-date"],
+        )
+
+        assert tampered_signature != authorization["signature"]
+
+        # The same recomputation over the unmodified headers still matches,
+        # proving the mismatch is caused by the target resource change.
+        intact_signature, _ = _recompute_sigv4_signature(
+            {
+                key: value
+                for key, value in header_map.items()
+                if key != "Authorization"
+            },
+            signed_request["url"],
+            signed_request["method"],
+            temp_creds,
+            self.AWS_REGION,
+            header_map["x-amz-date"],
+        )
+        assert intact_signature == authorization["signature"]
+
+    def test_unsigned_target_resource_construction_is_rejected(self):
+        """End-to-end counterexample of the previous construction order.
+
+        Builds the GetCallerIdentity request the vulnerable way: sign without
+        x-goog-cloud-target-resource and inject the header afterwards. The
+        independently recomputed signature over the actual serialized headers
+        must not match the embedded signature, demonstrating why the header
+        has to be passed into the signing process.
+        """
+        temp_creds = aws.AwsSecurityCredentials(
+            ACCESS_KEY_ID, SECRET_ACCESS_KEY, TOKEN
+        )
+        signer = aws.RequestSigner(self.AWS_REGION)
+        # Vulnerable ordering: the target resource is not part of the sign call.
+        request_options = signer.get_request_options(
+            temp_creds, self.STS_URL, "POST"
+        )
+        request_options["headers"]["x-goog-cloud-target-resource"] = AUDIENCE
+
+        header_map = request_options["headers"]
+        authorization = _extract_authorization_parts(
+            header_map["Authorization"]
+        )
+        assert "x-goog-cloud-target-resource" not in authorization[
+            "signed_headers"
+        ]
+
+        recomputed_signature, _ = _recompute_sigv4_signature(
+            {
+                key: value
+                for key, value in header_map.items()
+                if key != "Authorization"
+            },
+            request_options["url"],
+            request_options["method"],
+            temp_creds,
+            self.AWS_REGION,
+            header_map["x-amz-date"],
+        )
+        assert recomputed_signature != authorization["signature"]
+
+        # The production construction (header signed up front) verifies cleanly.
+        safe_options = signer.get_request_options(
+            temp_creds,
+            self.STS_URL,
+            "POST",
+            additional_headers={"x-goog-cloud-target-resource": AUDIENCE},
+        )
+        safe_authorization = _extract_authorization_parts(
+            safe_options["headers"]["Authorization"]
+        )
+        safe_signature, _ = _recompute_sigv4_signature(
+            {
+                key: value
+                for key, value in safe_options["headers"].items()
+                if key != "Authorization"
+            },
+            safe_options["url"],
+            safe_options["method"],
+            temp_creds,
+            self.AWS_REGION,
+            safe_options["headers"]["x-amz-date"],
+        )
+        assert safe_signature == safe_authorization["signature"]
+
+    def test_sts_exchange_request_matches_signed_intent_default_supplier(self):
+        temp_creds = aws.AwsSecurityCredentials(
+            ACCESS_KEY_ID, SECRET_ACCESS_KEY, TOKEN
+        )
+        request = self._default_supplier_request()
+        credentials = self._default_credentials()
+        credentials.refresh(request)
+
+        sts_call = request.call_args_list[-1][1]
+        sts_body = dict(
+            (key.decode("utf-8"), value.decode("utf-8"))
+            for key, value in urllib.parse.parse_qsl(sts_call["body"])
+        )
+
+        assert sts_call["url"] == TOKEN_URL
+        assert sts_call["method"] == "POST"
+        assert sts_body["grant_type"] == (
+            "urn:ietf:params:oauth:grant-type:token-exchange"
+        )
+        assert sts_body["subject_token_type"] == SUBJECT_TOKEN_TYPE
+
+        signed_request = _parse_subject_token(sts_body["subject_token"])
+        header_map = _subject_token_header_map(sts_body["subject_token"])
+
+        # The STS audience and the signed target resource are the same intent.
+        assert sts_body["audience"] == AUDIENCE
+        assert header_map["x-goog-cloud-target-resource"] == AUDIENCE
+        assert sts_body["audience"] == header_map[
+            "x-goog-cloud-target-resource"
+        ]
+
+        # The serialized signed request targets AWS STS GetCallerIdentity.
+        assert signed_request["url"] == self.STS_URL
+        assert signed_request["method"] == "POST"
+
+        # The temporary session token is both serialized and covered by the
+        # signature.
+        assert header_map["x-amz-security-token"] == TOKEN
+        authorization = _extract_authorization_parts(
+            header_map["Authorization"]
+        )
+        assert "x-amz-security-token" in authorization["signed_headers"]
+
+        recomputed_signature, _ = _recompute_sigv4_signature(
+            {
+                key: value
+                for key, value in header_map.items()
+                if key != "Authorization"
+            },
+            signed_request["url"],
+            signed_request["method"],
+            temp_creds,
+            self.AWS_REGION,
+            header_map["x-amz-date"],
+        )
+        assert recomputed_signature == authorization["signature"]
+
+    def test_sts_exchange_request_matches_signed_intent_custom_supplier(self):
+        permanent_creds = aws.AwsSecurityCredentials(
+            ACCESS_KEY_ID, SECRET_ACCESS_KEY
+        )
+        request = TestCredentials.make_mock_request(
+            token_status=http_client.OK,
+            token_data=TestCredentials.SUCCESS_RESPONSE,
+        )
+        credentials = self._supplier_credentials(permanent_creds)
+        credentials.refresh(request)
+
+        # A custom supplier performs no IMDS calls: the only call is STS.
+        assert len(request.call_args_list) == 1
+        sts_call = request.call_args_list[0][1]
+        sts_body = dict(
+            (key.decode("utf-8"), value.decode("utf-8"))
+            for key, value in urllib.parse.parse_qsl(sts_call["body"])
+        )
+
+        assert sts_call["url"] == TOKEN_URL
+        assert sts_call["method"] == "POST"
+        assert sts_body["audience"] == AUDIENCE
+
+        signed_request = _parse_subject_token(sts_body["subject_token"])
+        header_map = _subject_token_header_map(sts_body["subject_token"])
+        assert (
+            header_map["x-goog-cloud-target-resource"]
+            == sts_body["audience"]
+        )
+        assert signed_request["url"] == self.STS_URL
+        assert signed_request["method"] == "POST"
+        # Permanent credentials carry no session token and none is serialized.
+        assert "x-amz-security-token" not in header_map
+
+        authorization = _extract_authorization_parts(
+            header_map["Authorization"]
+        )
+        recomputed_signature, _ = _recompute_sigv4_signature(
+            {
+                key: value
+                for key, value in header_map.items()
+                if key != "Authorization"
+            },
+            signed_request["url"],
+            signed_request["method"],
+            permanent_creds,
+            self.AWS_REGION,
+            header_map["x-amz-date"],
+        )
+        assert recomputed_signature == authorization["signature"]
+
+    def test_changing_target_changes_audience_and_signature(self):
+        temp_creds = aws.AwsSecurityCredentials(
+            ACCESS_KEY_ID, SECRET_ACCESS_KEY, TOKEN
+        )
+
+        original_request = TestCredentials.make_mock_request(
+            token_status=http_client.OK,
+            token_data=TestCredentials.SUCCESS_RESPONSE,
+        )
+        original_credentials = self._supplier_credentials(temp_creds)
+        original_credentials.refresh(original_request)
+        original_sts = original_request.call_args_list[-1][1]
+        original_body = dict(
+            (key.decode("utf-8"), value.decode("utf-8"))
+            for key, value in urllib.parse.parse_qsl(original_sts["body"])
+        )
+
+        alternate_request = TestCredentials.make_mock_request(
+            token_status=http_client.OK,
+            token_data=TestCredentials.SUCCESS_RESPONSE,
+        )
+        alternate_credentials = self._supplier_credentials(
+            temp_creds, ALTERNATE_AUDIENCE
+        )
+        alternate_credentials.refresh(alternate_request)
+        alternate_sts = alternate_request.call_args_list[-1][1]
+        alternate_body = dict(
+            (key.decode("utf-8"), value.decode("utf-8"))
+            for key, value in urllib.parse.parse_qsl(alternate_sts["body"])
+        )
+
+        # Same credential source, changed target configuration: the STS
+        # audience and signed header move together.
+        assert original_body["audience"] == AUDIENCE
+        assert alternate_body["audience"] == ALTERNATE_AUDIENCE
+        original_headers = _subject_token_header_map(
+            original_body["subject_token"]
+        )
+        alternate_headers = _subject_token_header_map(
+            alternate_body["subject_token"]
+        )
+        assert (
+            original_headers["x-goog-cloud-target-resource"] == AUDIENCE
+        )
+        assert (
+            alternate_headers["x-goog-cloud-target-resource"]
+            == ALTERNATE_AUDIENCE
+        )
+        # The signature must change because the target is part of it.
+        original_signature = _extract_authorization_parts(
+            original_headers["Authorization"]
+        )["signature"]
+        alternate_signature = _extract_authorization_parts(
+            alternate_headers["Authorization"]
+        )["signature"]
+        assert original_signature != alternate_signature
+
+    def test_swapping_credentials_changes_signature_but_not_target(self):
+        temp_creds = aws.AwsSecurityCredentials(
+            ACCESS_KEY_ID, SECRET_ACCESS_KEY, TOKEN
+        )
+        alternate_creds = aws.AwsSecurityCredentials(
+            ALTERNATE_ACCESS_KEY_ID,
+            ALTERNATE_SECRET_ACCESS_KEY,
+            ALTERNATE_TOKEN,
+        )
+
+        signatures = {}
+        session_tokens = {}
+        for label, creds in (
+            ("original", temp_creds),
+            ("swapped", alternate_creds),
+        ):
+            request = TestCredentials.make_mock_request(
+                token_status=http_client.OK,
+                token_data=TestCredentials.SUCCESS_RESPONSE,
+            )
+            credentials = self._supplier_credentials(creds)
+            credentials.refresh(request)
+            sts_body = dict(
+                (key.decode("utf-8"), value.decode("utf-8"))
+                for key, value in urllib.parse.parse_qsl(
+                    request.call_args_list[-1][1]["body"]
+                )
+            )
+            header_map = _subject_token_header_map(sts_body["subject_token"])
+            signatures[label] = _extract_authorization_parts(
+                header_map["Authorization"]
+            )
+            session_tokens[label] = header_map["x-amz-security-token"]
+            # Target configuration is unchanged.
+            assert sts_body["audience"] == AUDIENCE
+            assert (
+                header_map["x-goog-cloud-target-resource"] == AUDIENCE
+            )
+
+        assert signatures["original"]["signature"] != (
+            signatures["swapped"]["signature"]
+        )
+        assert signatures["original"]["credential"].startswith(
+            ACCESS_KEY_ID + "/"
+        )
+        assert signatures["swapped"]["credential"].startswith(
+            ALTERNATE_ACCESS_KEY_ID + "/"
+        )
+        assert session_tokens["original"] == TOKEN
+        assert session_tokens["swapped"] == ALTERNATE_TOKEN
+
+    def test_recorded_signature_expectations_artifact_is_in_sync(self):
+        records = self._all_records()
+
+        with open(AWS_SIGNATURE_EXPECTATIONS_PATH, "r") as file_handle:
+            expected_records = json.load(file_handle)
+
+        assert expected_records == records
+
+        # Cross-check the invariant directly for every recorded scenario.
+        for record in records:
+            signed = record["signed_get_caller_identity"]
+            assert signed["signatures_match"] is True
+            assert signed["signed_headers_match"] is True
+            assert "x-goog-cloud-target-resource" in signed["signed_headers"]
+            assert record["intent_alignment"][
+                "audience_equals_signed_target"
+            ] is True
+            assert record["sts"]["url"] == TOKEN_URL
+            assert record["sts"]["method"] == "POST"
+            assert record["signed_get_caller_identity"]["url"] == self.STS_URL
+            assert record["signed_get_caller_identity"]["method"] == "POST"
+
+        # Swapped credentials and changed target yield distinct signatures,
+        # while the two temporary-credential runs share the same signature.
+        by_label = {record["label"]: record for record in records}
+        assert (
+            by_label["default_supplier_temporary_credentials"][
+                "signed_get_caller_identity"
+            ]["embedded_signature"]
+            == by_label["custom_supplier_temporary_credentials"][
+                "signed_get_caller_identity"
+            ]["embedded_signature"]
+        )
+        assert (
+            by_label["custom_supplier_alternate_target"][
+                "signed_get_caller_identity"
+            ]["embedded_signature"]
+            != by_label["custom_supplier_temporary_credentials"][
+                "signed_get_caller_identity"
+            ]["embedded_signature"]
+        )
+        assert (
+            by_label["custom_supplier_swapped_credentials"][
+                "signed_get_caller_identity"
+            ]["embedded_signature"]
+            != by_label["custom_supplier_temporary_credentials"][
+                "signed_get_caller_identity"
+            ]["embedded_signature"]
+        )
