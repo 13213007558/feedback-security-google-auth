@@ -234,9 +234,19 @@ class Credentials(external_account.Credentials):
         # Handle executable output.
         response = json.loads(result.stdout.decode("utf-8")) if result.stdout else None
         if not response and self._credential_source_executable_output_file is not None:
-            response = json.load(
-                open(self._credential_source_executable_output_file, encoding="utf-8")
-            )
+            # In interactive mode, the executable is expected to write its response
+            # to the output file. Surface a refresh error instead of leaking the
+            # underlying file/JSON error if it failed to do so.
+            try:
+                with open(
+                    self._credential_source_executable_output_file, encoding="utf-8"
+                ) as output_file:
+                    response = json.load(output_file)
+            except (IOError, OSError, ValueError) as exc:
+                raise exceptions.RefreshError(
+                    "The executable finished successfully but did not produce a "
+                    "valid output file."
+                ) from exc
 
         subject_token = self._parse_subject_token(response)
         return subject_token

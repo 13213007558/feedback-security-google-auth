@@ -1259,3 +1259,276 @@ class TestCredentials(object):
                 stderr=subprocess.STDOUT,
                 env=mock.ANY,
             )
+
+
+class TestPluggableCachedResultHandling(object):
+    """Offline tests for output_file cached results.
+
+    Per the executable response protocol (AIP-4117), a cached response is only
+    reused when it is structurally valid and unexpired. Transient problems
+    (expiration, missing expiration_time, an unsupported token_type, or
+    success=false with code/message) must trigger another executable run, while
+    structural problems (missing schema fields, success=false without
+    code/message) must surface an error immediately. A cached token is never
+    silently discarded and never sent to STS on a failure path.
+    """
+
+    CACHED_TOKEN = "CACHED_FAKE_SUBJECT_TOKEN"
+    FRESH_TOKEN = "FRESH_FAKE_SUBJECT_TOKEN"
+    VALID_CACHED_RESPONSE = {
+        "version": 1,
+        "success": True,
+        "token_type": "urn:ietf:params:oauth:token-type:id_token",
+        "id_token": CACHED_TOKEN,
+        "expiration_time": 9999999999,
+    }
+    FRESH_RESPONSE = {
+        "version": 1,
+        "success": True,
+        "token_type": "urn:ietf:params:oauth:token-type:id_token",
+        "id_token": FRESH_TOKEN,
+        "expiration_time": 9999999999,
+    }
+
+    def _write_cache(self, output_file, response):
+        with open(str(output_file), "w", encoding="utf-8") as file_obj:
+            json.dump(response, file_obj)
+
+    def _make_credentials(self, output_file, interactive=False, audience=AUDIENCE):
+        executable = {
+            "command": "command",
+            "timeout_millis": 30000,
+            "output_file": str(output_file),
+        }
+        if interactive:
+            executable["interactive_timeout_millis"] = 300000
+        return pluggable.Credentials(
+            audience=audience,
+            subject_token_type=SUBJECT_TOKEN_TYPE,
+            token_url=TOKEN_URL,
+            token_info_url=TOKEN_INFO_URL,
+            credential_source={"executable": executable},
+            interactive=interactive,
+        )
+
+    def _mock_subprocess_returning(self, response):
+        return mock.patch(
+            "subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=[],
+                stdout=json.dumps(response).encode("utf-8") if response else b"",
+                returncode=0,
+            ),
+        )
+
+    def _assert_token_not_leaked(self, exc, *tokens):
+        message = str(exc)
+        for token in tokens:
+            assert token not in message
+
+    @mock.patch.dict(
+        os.environ, {"GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES": "0"}
+    )
+    def test_executables_disallowed_valid_cache_errors_without_running(
+        self, tmpdir
+    ):
+        output_file = tmpdir.join("cached_credentials")
+        self._write_cache(output_file, self.VALID_CACHED_RESPONSE)
+        credentials = self._make_credentials(output_file)
+
+        with mock.patch("subprocess.run") as mock_run:
+            with pytest.raises(exceptions.MalformedError) as excinfo:
+                credentials.retrieve_subject_token(None)
+
+        assert excinfo.match(r"Executables need to be explicitly allowed")
+        self._assert_token_not_leaked(excinfo.value, self.CACHED_TOKEN)
+        mock_run.assert_not_called()
+
+    @mock.patch.dict(
+        os.environ, {"GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES": "0"}
+    )
+    def test_executables_disallowed_malformed_cache_is_not_silently_ignored(
+        self, tmpdir
+    ):
+        output_file = tmpdir.join("cached_credentials")
+        malformed_response = dict(self.VALID_CACHED_RESPONSE)
+        del malformed_response["version"]
+        self._write_cache(output_file, malformed_response)
+        credentials = self._make_credentials(output_file)
+
+        with mock.patch("subprocess.run") as mock_run:
+            with pytest.raises(exceptions.MalformedError) as excinfo:
+                credentials.retrieve_subject_token(None)
+
+        # The running-mode check fails before the cache is consulted: the bad
+        # cache is neither exchanged for an access token nor silently retried.
+        assert excinfo.match(r"Executables need to be explicitly allowed")
+        self._assert_token_not_leaked(excinfo.value, self.CACHED_TOKEN)
+        mock_run.assert_not_called()
+
+    @mock.patch.dict(os.environ, {"GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES": "1"})
+    def test_expired_cache_reruns_executable_and_uses_fresh_token(self, tmpdir):
+        output_file = tmpdir.join("cached_credentials")
+        expired_response = dict(
+            self.VALID_CACHED_RESPONSE, expiration_time=0
+        )
+        self._write_cache(output_file, expired_response)
+        credentials = self._make_credentials(output_file)
+        credentials._sts_client = mock.MagicMock()
+        credentials._sts_client.exchange_token.return_value = {
+            "access_token": "access_token",
+            "expires_in": 3600,
+        }
+
+        with self._mock_subprocess_returning(self.FRESH_RESPONSE) as mock_run:
+            credentials.refresh(mock.sentinel.request)
+
+        mock_run.assert_called_once()
+        _, kwargs = credentials._sts_client.exchange_token.call_args
+        assert kwargs["subject_token"] == self.FRESH_TOKEN
+        assert kwargs["subject_token"] != self.CACHED_TOKEN
+
+    @mock.patch.dict(os.environ, {"GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES": "1"})
+    def test_cache_without_expiration_time_reruns_executable(self, tmpdir):
+        output_file = tmpdir.join("cached_credentials")
+        no_expiration_response = dict(self.VALID_CACHED_RESPONSE)
+        del no_expiration_response["expiration_time"]
+        self._write_cache(output_file, no_expiration_response)
+        credentials = self._make_credentials(output_file)
+        credentials._sts_client = mock.MagicMock()
+        credentials._sts_client.exchange_token.return_value = {
+            "access_token": "access_token",
+            "expires_in": 3600,
+        }
+
+        with self._mock_subprocess_returning(self.FRESH_RESPONSE) as mock_run:
+            credentials.refresh(mock.sentinel.request)
+
+        mock_run.assert_called_once()
+        _, kwargs = credentials._sts_client.exchange_token.call_args
+        assert kwargs["subject_token"] == self.FRESH_TOKEN
+
+    @mock.patch.dict(os.environ, {"GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES": "1"})
+    def test_cache_with_unsupported_token_type_reruns_executable(self, tmpdir):
+        output_file = tmpdir.join("cached_credentials")
+        unsupported_type_response = dict(
+            self.VALID_CACHED_RESPONSE,
+            token_type="urn:ietf:params:oauth:token-type:unsupported",
+        )
+        self._write_cache(output_file, unsupported_type_response)
+        credentials = self._make_credentials(output_file)
+        credentials._sts_client = mock.MagicMock()
+        credentials._sts_client.exchange_token.return_value = {
+            "access_token": "access_token",
+            "expires_in": 3600,
+        }
+
+        with self._mock_subprocess_returning(self.FRESH_RESPONSE) as mock_run:
+            credentials.refresh(mock.sentinel.request)
+
+        mock_run.assert_called_once()
+        _, kwargs = credentials._sts_client.exchange_token.call_args
+        assert kwargs["subject_token"] == self.FRESH_TOKEN
+
+    @mock.patch.dict(os.environ, {"GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES": "1"})
+    def test_cache_missing_token_type_errors_without_running_or_sts(
+        self, tmpdir
+    ):
+        output_file = tmpdir.join("cached_credentials")
+        missing_token_type_response = dict(self.VALID_CACHED_RESPONSE)
+        del missing_token_type_response["token_type"]
+        self._write_cache(output_file, missing_token_type_response)
+        credentials = self._make_credentials(output_file)
+
+        with mock.patch("subprocess.run") as mock_run:
+            with pytest.raises(exceptions.MalformedError) as excinfo:
+                credentials.retrieve_subject_token(None)
+
+        assert excinfo.match(
+            r"The executable response is missing the token_type field."
+        )
+        self._assert_token_not_leaked(excinfo.value, self.CACHED_TOKEN)
+        mock_run.assert_not_called()
+
+    @mock.patch.dict(os.environ, {"GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES": "1"})
+    def test_unsuccessful_cache_reruns_executable(self, tmpdir):
+        output_file = tmpdir.join("cached_credentials")
+        unsuccessful_response = {
+            "version": 1,
+            "success": False,
+            "code": "401",
+            "message": "Permission denied.",
+        }
+        self._write_cache(output_file, unsuccessful_response)
+        credentials = self._make_credentials(output_file)
+        credentials._sts_client = mock.MagicMock()
+        credentials._sts_client.exchange_token.return_value = {
+            "access_token": "access_token",
+            "expires_in": 3600,
+        }
+
+        with self._mock_subprocess_returning(self.FRESH_RESPONSE) as mock_run:
+            credentials.refresh(mock.sentinel.request)
+
+        mock_run.assert_called_once()
+        _, kwargs = credentials._sts_client.exchange_token.call_args
+        assert kwargs["subject_token"] == self.FRESH_TOKEN
+
+    @mock.patch.dict(os.environ, {"GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES": "1"})
+    def test_unsuccessful_cache_without_code_message_errors_without_running(
+        self, tmpdir
+    ):
+        output_file = tmpdir.join("cached_credentials")
+        self._write_cache(
+            output_file, {"version": 1, "success": False}
+        )
+        credentials = self._make_credentials(output_file)
+
+        with mock.patch("subprocess.run") as mock_run:
+            with pytest.raises(exceptions.MalformedError) as excinfo:
+                credentials.retrieve_subject_token(None)
+
+        assert excinfo.match(
+            r"Error code and message fields are required in the response."
+        )
+        mock_run.assert_not_called()
+
+    @mock.patch.dict(os.environ, {"GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES": "1"})
+    def test_interactive_mode_output_file_not_updated_errors(self, tmpdir):
+        output_file = tmpdir.join("cached_credentials")
+        assert not os.path.exists(str(output_file))
+        credentials = self._make_credentials(
+            output_file, interactive=True, audience=WORKFORCE_AUDIENCE
+        )
+
+        with self._mock_subprocess_returning(None) as mock_run:
+            with pytest.raises(exceptions.RefreshError) as excinfo:
+                credentials.retrieve_subject_token(None)
+
+        assert excinfo.match(
+            r"The executable finished successfully but did not produce a valid output file."
+        )
+        mock_run.assert_called_once()
+
+    @mock.patch.dict(os.environ, {"GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES": "1"})
+    def test_interactive_mode_stale_output_file_not_reused_for_sts(self, tmpdir):
+        output_file = tmpdir.join("cached_credentials")
+        self._write_cache(
+            output_file,
+            dict(self.VALID_CACHED_RESPONSE, expiration_time=0),
+        )
+        credentials = self._make_credentials(
+            output_file, interactive=True, audience=WORKFORCE_AUDIENCE
+        )
+        credentials._sts_client = mock.MagicMock()
+
+        # The executable exits successfully but leaves the expired cache
+        # untouched. The stale token must never reach STS.
+        with self._mock_subprocess_returning(None) as mock_run:
+            with pytest.raises(exceptions.RefreshError) as excinfo:
+                credentials.refresh(mock.sentinel.request)
+
+        assert excinfo.match(r"The token returned by the executable is expired.")
+        self._assert_token_not_leaked(excinfo.value, self.CACHED_TOKEN)
+        mock_run.assert_called_once()
+        credentials._sts_client.exchange_token.assert_not_called()
